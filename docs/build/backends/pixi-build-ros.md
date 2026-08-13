@@ -18,7 +18,7 @@ It provides seamless integration with Pixi's package management workflow while s
 This backend automatically generates conda packages from ROS projects by:
 
 - **package.xml Integration**: Automatically reads package metadata (name, version, description, maintainers, dependencies) from your ROS `package.xml` file
-- **Multi-build system support**: Supports ament_cmake, ament_python, catkin, and cmake build types
+- **Multi-build system support**: Supports ament_cmake, ament_python, ament_cargo, catkin, and cmake build types
 - **ROS Distribution Support**: Works with both ROS1 and ROS2 distributions (noetic, humble, jazzy, etc.)
 - **Cross-platform support**: Supports Linux, macOS and Windows
 - **Automatic dependency mapping**: Maps ROS dependencies to conda packages using RoboStack mappings
@@ -309,7 +309,7 @@ cxx_compiler = ["vs2019"]
 
 The ROS backend follows this build process:
 
-1. **Package Detection**: Parses `package.xml` to determine build type (`ament_cmake`, `ament_python`, `catkin`)
+1. **Package Detection**: Parses `package.xml` to determine build type (`ament_cmake`, `ament_python`, `ament_cargo`, `catkin`)
 2. **Dependency Resolution**: Maps ROS dependencies to conda packages using RoboStack mappings
 3. **Environment Setup**: Configures ROS-specific environment variables
 4. **Build Execution**: Uses the appropriate build template based on package type.
@@ -326,6 +326,46 @@ For C++ packages using ament build system:
   <build_type>ament_cmake</build_type>
 </export>
 ```
+
+### ament_cargo (ROS2)
+For ROS packages on Linux, macOS, and Windows that provide a standalone Rust executable or node:
+
+```xml
+<export>
+  <build_type>ament_cargo</build_type>
+</export>
+```
+
+The package directory must contain a package-local `Cargo.toml`. Its `[package].name` must
+match the `<name>` in `package.xml`. The backend invokes Cargo directly with `cargo install
+--path`; it does not invoke `colcon`.
+
+Linux has native runtime validation. macOS and Windows have generated recipe/template
+validation pending native CI and should not be considered natively executed by this host.
+
+On POSIX targets, installed files use the following layout, where `<package-name>` is the ROS
+package name:
+
+```text
+$PREFIX/
+├── lib/<package-name>/<executable>
+└── share/
+    ├── <package-name>/package.xml
+    └── ament_index/resource_index/packages/<package-name>  # package marker
+```
+
+On Windows, the equivalent layout is rooted at `%LIBRARY_PREFIX%`:
+
+```text
+%LIBRARY_PREFIX%/
+├── lib/<package-name>/<executable>.exe
+└── share/
+    ├── <package-name>/package.xml
+    └── ament_index/resource_index/packages/<package-name>  # package marker
+```
+
+Cargo workspaces, Cargo `path` dependencies, and layouts that expect Rust dependencies to be
+pre-installed rather than declared for Cargo resolution are unsupported.
 
 ### ament_python (ROS2)
 For Python packages using ament build system:

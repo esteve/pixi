@@ -1,3 +1,4 @@
+mod ament_cargo;
 mod build_script;
 pub mod config;
 mod distro;
@@ -13,7 +14,7 @@ use std::sync::Arc;
 use config::RosBackendConfig;
 use fs_err as fs;
 use miette::IntoDiagnostic;
-use pixi_build_backend::compilers::default_compiler_variants;
+use pixi_build_backend::compilers::{Language, compiler_requirement, default_compiler_variants};
 use pixi_build_backend::generated_recipe::{GenerateRecipe, GeneratedRecipe, PythonParams};
 use pixi_build_backend::intermediate_backend::IntermediateBackendInstantiator;
 use pixi_build_backend::tools::BackendIdentifier;
@@ -22,6 +23,7 @@ use rattler_build_recipe::stage0::{Item, Script, SerializableMatchSpec, Value};
 use rattler_build_types::NormalizedKey;
 use rattler_conda_types::{ChannelUrl, Platform};
 
+use crate::ament_cargo::{AMENT_CARGO_BUILD_TYPE, AmentCargoBuildScriptContext};
 use crate::build_script::render_build_script;
 use crate::config::{PackageMappingSource, extract_distro_from_channels_list};
 use crate::distro::Distro;
@@ -101,6 +103,7 @@ impl GenerateRecipe for RosGenerator {
         // Parse package.xml
         let package_xml_path = manifest_root.join("package.xml");
         let package_xml_content = fs::read_to_string(&package_xml_path).into_diagnostic()?;
+        let parsed_package_xml = PackageXml::parse(&package_xml_content)?;
 
         // Set up ROS environment for condition evaluation
         let ros_version_str = if distro.is_ros1 { "1" } else { "2" };
@@ -113,9 +116,9 @@ impl GenerateRecipe for RosGenerator {
             }
         }
 
-        let package_xml = PackageXml::parse(&package_xml_content)
-            .map(|package_xml| package_xml.evaluate_conditions(&env_vars))?;
-
+        let package_xml = parsed_package_xml.evaluate_conditions(&env_vars);
+        let build_type = package_xml.build_type();
+        let is_ament_cargo = build_type == AMENT_CARGO_BUILD_TYPE;
         // Create metadata provider
         let package_mapping_files: Vec<String> = config
             .get_package_mapping_file_paths()
@@ -131,6 +134,11 @@ impl GenerateRecipe for RosGenerator {
             extra_input_globs.clone(),
             package_mapping_files,
         )?;
+        if is_ament_cargo {
+            generated_recipe
+                .metadata_input_globs
+                .push("Cargo.toml".to_string());
+        }
 
         // `parse_and_render` already populated `metadata_input_globs` with
         // the provider's anchored package-local patterns (`setup.py`,
@@ -151,8 +159,18 @@ impl GenerateRecipe for RosGenerator {
         let package_map_data = load_package_map_data(&all_mapping_sources);
 
         // Get requirements from package.xml
+        let mapping_package_xml = if is_ament_cargo {
+            let mut package_xml = package_xml.clone();
+            package_xml
+                .dependencies
+                .buildtool_depends
+                .retain(|dependency| dependency.name != AMENT_CARGO_BUILD_TYPE);
+            package_xml
+        } else {
+            package_xml.clone()
+        };
         let mut package_requirements = package_xml_to_conda_requirements(
-            &package_xml,
+            &mapping_package_xml,
             &distro,
             host_platform,
             &package_map_data,
@@ -267,12 +285,16 @@ impl GenerateRecipe for RosGenerator {
         }
 
         // Add compiler dependencies
-        let c_compiler =
-            JinjaTemplate::new("${{ compiler('c') }}".to_string()).expect("valid jinja template");
-        let cxx_compiler =
-            JinjaTemplate::new("${{ compiler('cxx') }}".to_string()).expect("valid jinja template");
-        build_items.push(Item::Value(Value::new_template(c_compiler, None)));
-        build_items.push(Item::Value(Value::new_template(cxx_compiler, None)));
+        if is_ament_cargo {
+            build_items.push(compiler_requirement(&Language::Rust));
+        } else {
+            let c_compiler = JinjaTemplate::new("${{ compiler('c') }}".to_string())
+                .expect("valid jinja template");
+            let cxx_compiler = JinjaTemplate::new("${{ compiler('cxx') }}".to_string())
+                .expect("valid jinja template");
+            build_items.push(Item::Value(Value::new_template(c_compiler, None)));
+            build_items.push(Item::Value(Value::new_template(cxx_compiler, None)));
+        }
 
         // Add host dependencies
         let host_dep_names = ["python", "numpy", "pip", "pkg-config"];
@@ -301,8 +323,12 @@ impl GenerateRecipe for RosGenerator {
         requirements.run = merge_conditional_lists(&requirements.run, &run_items)?;
 
         // Generate build script
-        let build_type = package_xml.build_type();
-        let build_script_content = render_build_script(&build_type, &distro_name, &manifest_root)?;
+        let build_script_content = if is_ament_cargo {
+            AmentCargoBuildScriptContext::new(&manifest_root, &package_xml.name, host_platform)?
+                .render()
+        } else {
+            render_build_script(&build_type, &distro_name, &manifest_root)?
+        };
 
         let mut script_env: indexmap::IndexMap<String, Value<String>> = indexmap::IndexMap::new();
         script_env.insert(
@@ -332,6 +358,13 @@ impl GenerateRecipe for RosGenerator {
         _workdir: impl AsRef<Path>,
         editable: bool,
     ) -> miette::Result<Vec<String>> {
+        let workdir = _workdir.as_ref();
+        let is_ament_cargo = workdir.join("package.xml").is_file()
+            && fs::read_to_string(workdir.join("package.xml"))
+                .ok()
+                .and_then(|content| PackageXml::parse(&content).ok())
+                .is_some_and(|package| package.build_type() == AMENT_CARGO_BUILD_TYPE);
+
         let mut globs: Vec<&str> = vec![
             "**/*.c",
             "**/*.cpp",
@@ -364,6 +397,9 @@ impl GenerateRecipe for RosGenerator {
         if let Some(extra) = &config.extra_input_globs {
             result.extend(extra.iter().cloned());
         }
+        if is_ament_cargo {
+            result.push("Cargo.toml".to_string());
+        }
         Ok(result)
     }
 
@@ -393,7 +429,11 @@ pub async fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::process::Command;
 
     use pixi_build_types::ProjectModel;
     use rattler_conda_types::Platform;
@@ -416,6 +456,50 @@ mod tests {
     fn default_package_map() -> HashMap<String, package_map::PackageMapEntry> {
         let content = include_str!("../robostack.yaml");
         serde_yaml::from_str(content).unwrap()
+    }
+
+    fn write_ament_cargo_package(dir: &std::path::Path, name: &str) {
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+        )
+        .unwrap();
+        fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            dir.join("package.xml"),
+            format!(
+                r#"<?xml version="1.0"?>
+<package format="3">
+  <name>{name}</name>
+  <version>0.1.0</version>
+  <description>standalone cargo node</description>
+  <maintainer email="test@example.com">Tester</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_cargo</buildtool_depend>
+  <export><build_type>ament_cargo</build_type></export>
+</package>
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_fake_ament_cargo(build_prefix: &std::path::Path, name: &str, failing: bool) {
+        let cargo = build_prefix.join("bin/cargo");
+        fs::create_dir_all(cargo.parent().unwrap()).unwrap();
+        let script = if failing {
+            "#!/bin/sh\nexit 17\n".to_string()
+        } else {
+            format!(
+                "#!/bin/sh\nroot=\"\"\nprevious=\"\"\nfor argument in \"$@\"; do\n  if [ \"$previous\" = \"--root\" ]; then root=\"$argument\"; fi\n  previous=\"$argument\"\ndone\nmkdir -p \"$root/bin\"\nprintf '#!/bin/sh\\nexit 0\\n' > \"$root/bin/{name}\"\nchmod +x \"$root/bin/{name}\"\n"
+            )
+        };
+        fs::write(&cargo, script).unwrap();
+        let mut permissions = fs::metadata(&cargo).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(cargo, permissions).unwrap();
     }
 
     fn jazzy_distro() -> Distro {
@@ -638,6 +722,272 @@ mod tests {
           - ros-jazzy-std-msgs
           - ros2-distro-mutex
         "###);
+    }
+
+    #[tokio::test]
+    async fn test_ament_cargo_linux_recipe_is_standalone_and_uses_rust() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        write_ament_cargo_package(temp_dir.path(), "ament_demo");
+        let model = project_fixture!({ "targets": { "defaultTarget": {} } });
+        let config = RosBackendConfig {
+            distro: Some("jazzy".to_string()),
+            ..Default::default()
+        };
+
+        let generated = RosGenerator::default()
+            .generate_recipe(
+                &model,
+                &config,
+                temp_dir.path().to_path_buf(),
+                Platform::Linux64,
+                None,
+                &HashSet::new(),
+                vec![],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let build_specs: Vec<String> = generated
+            .recipe
+            .requirements
+            .build
+            .iter()
+            .filter_map(|item| match item {
+                Item::Value(value) => value.as_concrete().map(ToString::to_string),
+                _ => None,
+            })
+            .collect();
+        let build_templates: Vec<String> = generated
+            .recipe
+            .requirements
+            .build
+            .iter()
+            .filter_map(|item| match item {
+                Item::Value(value) => value.as_template().map(ToString::to_string),
+                _ => None,
+            })
+            .collect();
+        assert!(!build_specs.iter().any(|spec| spec.contains("ament-cargo")));
+        assert!(
+            build_templates
+                .iter()
+                .any(|template| { template.contains("compiler('rust')") })
+        );
+        assert!(
+            !build_templates
+                .iter()
+                .any(|template| template.contains("compiler('c')"))
+        );
+        assert!(
+            !build_templates
+                .iter()
+                .any(|template| template.contains("compiler('cxx')"))
+        );
+
+        let script = generated
+            .recipe
+            .build
+            .script
+            .content
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find_map(|item| match item {
+                Item::Value(value) => value.as_concrete(),
+                _ => None,
+            })
+            .unwrap();
+        assert!(script.contains("CARGO_HOME"));
+        assert!(script.contains("--root \"$staging_dir\""));
+        assert!(script.contains("--target-dir \"$target_dir\""));
+        assert!(script.contains("resource_index/packages"));
+        assert!(script.contains("package.xml"));
+        assert!(!script.contains("--locked"));
+        assert!(!script.contains("--config"));
+        assert!(!script.contains("rust_packages"));
+        assert!(!script.contains("Cargo.lock"));
+
+        assert!(
+            generated
+                .metadata_input_globs
+                .iter()
+                .any(|glob| glob == "Cargo.toml")
+        );
+        assert!(
+            generated
+                .metadata_input_globs
+                .iter()
+                .any(|glob| glob == "package.xml")
+        );
+        assert!(
+            !generated
+                .metadata_input_globs
+                .iter()
+                .any(|glob| glob == "Cargo.lock")
+        );
+        let input_globs = RosGenerator::default()
+            .extract_input_globs_from_build(&config, temp_dir.path(), false)
+            .unwrap();
+        assert!(input_globs.iter().any(|glob| glob == "Cargo.toml"));
+        assert!(input_globs.iter().any(|glob| glob == "package.xml"));
+    }
+
+    #[tokio::test]
+    async fn test_ament_cargo_recipe_uses_requested_platform_template() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        write_ament_cargo_package(temp_dir.path(), "ament_demo");
+        let model = project_fixture!({ "targets": { "defaultTarget": {} } });
+        let result = RosGenerator::default()
+            .generate_recipe(
+                &model,
+                &RosBackendConfig {
+                    distro: Some("jazzy".to_string()),
+                    ..Default::default()
+                },
+                temp_dir.path().to_path_buf(),
+                Platform::Win64,
+                None,
+                &HashSet::new(),
+                vec![],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        let windows = result.expect("ament_cargo should render for Windows");
+        let windows_script = windows
+            .recipe
+            .build
+            .script
+            .content
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find_map(|item| match item {
+                Item::Value(value) => value.as_concrete(),
+                _ => None,
+            })
+            .unwrap();
+        assert!(windows_script.starts_with("@echo off"));
+        assert!(windows_script.contains("DisableDelayedExpansion"));
+
+        let macos = RosGenerator::default()
+            .generate_recipe(
+                &model,
+                &RosBackendConfig {
+                    distro: Some("jazzy".to_string()),
+                    ..Default::default()
+                },
+                temp_dir.path().to_path_buf(),
+                Platform::Osx64,
+                None,
+                &HashSet::new(),
+                vec![],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("ament_cargo should render for macOS");
+        let macos_script = macos
+            .recipe
+            .build
+            .script
+            .content
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find_map(|item| match item {
+                Item::Value(value) => value.as_concrete(),
+                _ => None,
+            })
+            .unwrap();
+        assert!(macos_script.starts_with("#!/usr/bin/env bash"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ament_cargo_script_installs_only_binary_marker_and_package_xml() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source");
+        let build_prefix = temp_dir.path().join("build-prefix");
+        let prefix = temp_dir.path().join("prefix");
+        write_ament_cargo_package(&source, "ament_demo");
+        write_fake_ament_cargo(&build_prefix, "ament_demo", false);
+
+        let context =
+            AmentCargoBuildScriptContext::new(&source, "ament_demo", Platform::Linux64).unwrap();
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(context.render())
+            .env("BUILD_PREFIX", &build_prefix)
+            .env("PREFIX", &prefix)
+            .env(
+                "RATTLER_BUILD_PACKAGE_FILES",
+                temp_dir.path().join("package-files"),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(prefix.join("lib/ament_demo/ament_demo").is_file());
+        assert!(
+            prefix
+                .join("share/ament_index/resource_index/packages/ament_demo")
+                .is_file()
+        );
+        assert_eq!(
+            fs::read_to_string(prefix.join("share/ament_demo/package.xml")).unwrap(),
+            fs::read_to_string(source.join("package.xml")).unwrap()
+        );
+        assert!(
+            !prefix
+                .join("share/ament_index/resource_index/rust_packages")
+                .exists()
+        );
+        assert!(!build_prefix.join(".pixi-build-ros/ament-cargo").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ament_cargo_failure_returns_nonzero_cleans_state_and_writes_no_outputs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source");
+        let build_prefix = temp_dir.path().join("build-prefix");
+        let prefix = temp_dir.path().join("prefix");
+        let package_files = temp_dir.path().join("package-files");
+        write_ament_cargo_package(&source, "ament_demo");
+        write_fake_ament_cargo(&build_prefix, "ament_demo", true);
+
+        let context =
+            AmentCargoBuildScriptContext::new(&source, "ament_demo", Platform::Linux64).unwrap();
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(context.render())
+            .env("BUILD_PREFIX", &build_prefix)
+            .env("PREFIX", &prefix)
+            .env("RATTLER_BUILD_PACKAGE_FILES", &package_files)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!build_prefix.join(".pixi-build-ros/ament-cargo").exists());
+        assert!(!prefix.join("lib/ament_demo").exists());
+        assert!(
+            !prefix
+                .join("share/ament_index/resource_index/packages/ament_demo")
+                .exists()
+        );
+        assert!(!prefix.join("share/ament_demo/package.xml").exists());
+        assert!(!package_files.exists());
     }
 
     /// Helper to generate a recipe from a package.xml fixture.

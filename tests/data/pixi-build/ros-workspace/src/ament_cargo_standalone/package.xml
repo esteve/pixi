@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>ament_cargo_standalone</name>
+  <version>0.1.0</version>
+  <description>Standalone native Cargo ROS executable</description>
+  <maintainer email="test@example.com">Pixi Test</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cargo</buildtool_depend>
+
+  <export>
+    <build_type>ament_cargo</build_type>
+  </export>
+</package>

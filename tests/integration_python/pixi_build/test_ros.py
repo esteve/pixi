@@ -4,17 +4,25 @@ from pathlib import Path
 
 import pytest
 
-from .common import ExitCode, copytree_with_local_backend, package_files, verify_cli_command
+from .common import (
+    CURRENT_PLATFORM,
+    ExitCode,
+    copytree_with_local_backend,
+    package_files,
+    verify_cli_command,
+)
 
 ROS_WORKSPACE_NAME = "ros-workspace"
 ROS_PACKAGE_DIRS = ["navigator", "navigator_py", "distro_less_package"]
 ROS_IMPLICIT_PACKAGE_DIR = "navigator_implicit"
+ROS_AMENT_CARGO_PACKAGE_DIR = "ament_cargo_standalone"
 ROS_PACKAGE_OUTPUT_NAMES = {
     "navigator": "ros-humble-navigator",
     "navigator_py": "ros-humble-navigator-py",
     # The `humble` distro is automatically selected from the channels in the pixi.toml
     "distro_less_package": "ros-humble-distro-less-package",
 }
+ROS_AMENT_CARGO_OUTPUT_NAME = "ros-humble-ament-cargo-standalone"
 
 
 def _prepare_ros_workspace(build_data: Path, tmp_pixi_workspace: Path) -> Path:
@@ -116,6 +124,55 @@ def test_ros_packages_build_point_to_implicit_package_xml_fails(
             "is a directory, please provide the path to the manifest file",
             "did you mean package.xml",
         ],
+    )
+
+
+@pytest.mark.slow
+def test_ros_ament_cargo_standalone_builds_package(
+    pixi: Path, build_data: Path, tmp_pixi_workspace: Path
+) -> None:
+    if CURRENT_PLATFORM != "linux-64":
+        pytest.skip("native ament_cargo runtime evidence is collected on Linux")
+
+    workspace = _prepare_ros_workspace(build_data, tmp_pixi_workspace)
+    package_dir = workspace.joinpath("src", ROS_AMENT_CARGO_PACKAGE_DIR)
+    manifest_path = package_dir.joinpath("pixi.toml")
+    output_dir = workspace.joinpath("dist-ament-cargo")
+    artifact = _publish(pixi, manifest_path, output_dir)
+
+    files = package_files(artifact)
+    package_name = "ament_cargo_standalone"
+    assert any(path.endswith(f"lib/{package_name}/{package_name}") for path in files)
+    assert f"share/ament_index/resource_index/packages/{package_name}" in files
+    assert f"share/{package_name}/package.xml" in files
+    assert not any("rust_packages" in path for path in files)
+    assert not any(".pixi-build-ros" in path for path in files)
+    assert not any(path.endswith("/Cargo.toml") for path in files)
+    assert any(ROS_AMENT_CARGO_OUTPUT_NAME in path.name for path in output_dir.glob("*.conda"))
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("target_platform", ["osx-arm64", "win-64"])
+def test_ros_ament_cargo_standalone_renders_for_other_platforms(
+    pixi: Path,
+    build_data: Path,
+    tmp_pixi_workspace: Path,
+    target_platform: str,
+) -> None:
+    """Exercise recipe generation for non-native targets without claiming runtime execution."""
+    workspace = _prepare_ros_workspace(build_data, tmp_pixi_workspace)
+    manifest_path = workspace.joinpath("src", ROS_AMENT_CARGO_PACKAGE_DIR, "pixi.toml")
+    verify_cli_command(
+        [
+            pixi,
+            "publish",
+            "--dry-run",
+            "--target-platform",
+            target_platform,
+            "--path",
+            manifest_path,
+        ],
+        stderr_contains=ROS_AMENT_CARGO_OUTPUT_NAME,
     )
 
 
